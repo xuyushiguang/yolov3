@@ -1,0 +1,1138 @@
+import Foundation
+import UIKit
+import CoreML
+
+class YOLO {
+  public static var inputWidth = 320
+  public static var inputHeight = 320
+  public static let maxBoundingBoxes = 30
+
+  var modelType:Bool = UserDefaults.standard.bool(forKey: "kPDYOLOModel416Type")
+
+  // Tweak these values to get more or fewer predictions.
+  let confidenceThreshold: Float = 0.2
+  let iouThreshold: Float = 0.2
+
+  struct Prediction {
+    let classIndex: Int
+    let score: Float
+    let rect: CGRect
+  }
+    deinit {
+        print("********YOLO dealloc******")
+    }
+//  let model = YOLOv3()
+//    let model = Yolov3_tiny_v7()
+    var yoloModel:Any!
+    
+    public init() {
+        if modelType == true {
+            YOLO.inputWidth = 416
+            YOLO.inputHeight = 416
+            yoloModel = Yolov3_tiny_v7()
+        }else{
+            YOLO.inputWidth = 320
+            YOLO.inputHeight = 320
+            yoloModel = yolov3_tiny_v7_320()
+        }
+    }
+
+  public func predict(image: CVPixelBuffer) throws -> [Prediction] {
+    if modelType == true {
+        let model = yoloModel as! Yolov3_tiny_v7
+        if let output = try? model.prediction(input1: image) {
+            return computeBoundingBoxes(features: [output.output1, output.output2, output.output3])
+        } else {
+            return []
+        }
+    }else{
+        let model = yoloModel as! yolov3_tiny_v7_320
+        if let output = try? model.prediction(input1: image) {
+            return computeBoundingBoxes(features: [output.output1, output.output2, output.output3])
+        } else {
+            return []
+        }
+    }
+  }
+
+  public func computeBoundingBoxes(features: [MLMultiArray]) -> [Prediction] {
+    if modelType == true {
+        assert(features[0].count == 21*13*13)//21*13*13
+        assert(features[1].count == 21*26*26)//21*26*26
+        assert(features[2].count == 21*52*52)//21*52*52
+    }else{
+        assert(features[0].count == 21*10*10)//21*13*13
+        assert(features[1].count == 21*20*20)//21*26*26
+        assert(features[2].count == 21*40*40)//21*52*52
+    }
+    
+
+    var predictions = [Prediction]()
+
+    let blockSize: Float = 32
+    let boxesPerCell = 3
+    let numClasses = 2
+
+    // The 416x416 image is divided into a 13x13 grid. Each of these grid cells
+    // will predict 5 bounding boxes (boxesPerCell). A bounding box consists of
+    // five data items: x, y, width, height, and a confidence score. Each grid
+    // cell also predicts which class each bounding box belongs to.
+    //
+    // The "features" array therefore contains (numClasses + 5)*boxesPerCell
+    // values for each grid cell, i.e. 125 channels. The total features array
+    // contains 255x13x13 elements.
+
+    // NOTE: It turns out that accessing the elements in the multi-array as
+    // `features[[channel, cy, cx] as [NSNumber]].floatValue` is kinda slow.
+    // It's much faster to use direct memory access to the features.
+    var gridHeight:[Int]
+    var gridWidth:[Int]
+    if modelType == true{
+        gridHeight = [13, 26, 52]
+        gridWidth = [13, 26, 52]
+    }else{
+        gridHeight = [10, 20, 40]
+        gridWidth = [10, 20, 40]
+    }
+    
+    
+    var featurePointer = UnsafeMutablePointer<Double>(OpaquePointer(features[0].dataPointer))
+    var channelStride = features[0].strides[0].intValue
+    var yStride = features[0].strides[1].intValue
+    var xStride = features[0].strides[2].intValue
+
+    func offset(_ channel: Int, _ x: Int, _ y: Int) -> Int {
+      return channel*channelStride + y*yStride + x*xStride
+    }
+
+    for i in 0..<3 {
+        featurePointer = UnsafeMutablePointer<Double>(OpaquePointer(features[i].dataPointer))
+        channelStride = features[i].strides[0].intValue
+        yStride = features[i].strides[1].intValue
+        xStride = features[i].strides[2].intValue
+        for cy in 0..<gridHeight[i] {
+            for cx in 0..<gridWidth[i] {
+                for b in 0..<boxesPerCell {
+                    // For the first bounding box (b=0) we have to read channels 0-24,
+                    // for b=1 we have to read channels 25-49, and so on.
+                    let channel = b*(numClasses + 5)
+                    
+                    // The fast way:
+                    let tx = Float(featurePointer[offset(channel    , cx, cy)])
+                    let ty = Float(featurePointer[offset(channel + 1, cx, cy)])
+                    let tw = Float(featurePointer[offset(channel + 2, cx, cy)])
+                    let th = Float(featurePointer[offset(channel + 3, cx, cy)])
+                    let tc = Float(featurePointer[offset(channel + 4, cx, cy)])
+                    
+                    // The predicted tx and ty coordinates are relative to the location
+                    // of the grid cell; we use the logistic sigmoid to constrain these
+                    // coordinates to the range 0 - 1. Then we add the cell coordinates
+                    // (0-12) and multiply by the number of pixels per grid cell (32).
+                    // Now x and y represent center of the bounding box in the original
+                    // 416x416 image space.
+                    let scale = powf(2.0,Float(i)) // scale pos by 2^i where i is the scale pyramid level
+//                    let x = (Float(cx) * blockSize + sigmoid(tx))/scale
+//                    let y = (Float(cy) * blockSize + sigmoid(ty))/scale
+                    
+                    let x = ((Float(cx) + sigmoid(tx)) * blockSize)/scale
+                    let y = ((Float(cy) + sigmoid(ty)) * blockSize)/scale
+                    
+                    
+                    // The size of the bounding box, tw and th, is predicted relative to
+                    // the size of an "anchor" box. Here we also transform the width and
+                    // height into the original 416x416 image space.
+                    let w = exp(tw) * anchors[i][2*b    ]
+                    let h = exp(th) * anchors[i][2*b + 1]
+                    
+                    // The confidence value for the bounding box is given by tc. We use
+                    // the logistic sigmoid to turn this into a percentage.
+                    let confidence = sigmoid(tc)
+                    
+                    // Gather the predicted classes for this anchor box and softmax them,
+                    // so we can interpret these numbers as percentages.
+                    var classes = [Float](repeating: 0, count: numClasses)
+                    for c in 0..<numClasses {
+                        // The slow way:
+                        //classes[c] = features[[channel + 5 + c, cy, cx] as [NSNumber]].floatValue
+                        
+                        // The fast way:
+                        classes[c] = Float(featurePointer[offset(channel + 5 + c, cx, cy)])
+                    }
+                    classes = softmax(classes)
+                    
+                    // Find the index of the class with the largest score.
+                    let (detectedClass, bestClassScore) = classes.argmax()
+                    
+                    // Combine the confidence score for the bounding box, which tells us
+                    // how likely it is that there is an object in this box (but not what
+                    // kind of object it is), with the largest class prediction, which
+                    // tells us what kind of object it detected (but not where).
+                    let confidenceInClass = bestClassScore * confidence
+                    
+                    // Since we compute 13x13x3 = 507 bounding boxes, we only want to
+                    // keep the ones whose combined score is over a certain threshold.
+                    if confidenceInClass > confidenceThreshold {
+                        let rect = CGRect(x: CGFloat(x - w/2), y: CGFloat(y - h/2),
+                                          width: CGFloat(w), height: CGFloat(h))
+                        
+                        let prediction = Prediction(classIndex: detectedClass,
+                                                    score: confidenceInClass,
+                                                    rect: rect)
+                        predictions.append(prediction)
+                    }
+                }
+            }
+        }
+    }
+
+    // We already filtered out any bounding boxes that have very low scores,
+    // but there still may be boxes that overlap too much with others. We'll
+    // use "non-maximum suppression" to prune those duplicate bounding boxes.
+    return nonMaxSuppression(boxes: predictions, limit: YOLO.maxBoundingBoxes, threshold: iouThreshold)
+  }
+}
+
+import UIKit
+import Vision
+import AVFoundation
+import CoreMedia
+import VideoToolbox
+
+@objc protocol ZXObjectDetectionDelegate
+{
+    @objc optional func predictCells(cells : [ZXPredictionModel]);
+}
+
+public class ZXPredictionModel :NSObject{
+    
+    @objc var rect : CGRect       = CGRect.zero
+    @objc var typeString : String = ""
+    @objc var score: Float        = 0.0
+    @objc var image:UIImage       = UIImage()
+    @objc var longitude:Double    = 0.0
+    @objc var latitude:Double     = 0.0
+   
+    override init() {}
+}
+
+public class ZXObjectDetection: NSObject {
+    
+    public static var testDebug:Bool = UserDefaults.standard.bool(forKey: "kPDYOLOModel_Release_DEBUG_Type")
+    
+    @objc weak var delegate:ZXObjectDetectionDelegate?
+    
+    var yolo:YOLO? = YOLO.init()
+    
+    var request: VNCoreMLRequest!
+    
+    var boundingBoxes = [BoundingBox]()
+    var colors: [UIColor] = []
+    
+    let ciContext = CIContext()
+    var resizedPixelBuffer: CVPixelBuffer?
+    let ciCon = CIContext()
+    
+    var framesDone = 0
+    var frameCapturingStartTime = CACurrentMediaTime()
+    
+    var videoPreviewLayer: CALayer = CALayer()
+    
+    var predictStatus:Bool = false
+    
+    var isBusying:Int = 0
+    
+    
+    @objc func startPredict() {
+        predictStatus = true
+        isBusying = 0
+        
+        yolo = YOLO.init()
+        
+    }
+    
+    @objc func stopPredict() {
+        predictStatus = false
+        isBusying = 2
+        DispatchQueue.main.async {
+            for box:BoundingBox in self.boundingBoxes {
+                box.hide()
+            }
+        }
+        
+        yolo = nil
+    }
+    
+    @objc func setupPreviewLayer(layer:CALayer) {
+        DispatchQueue.main.async {
+            self.videoPreviewLayer = layer;
+            self.setUpCamera()
+        }
+    }
+    
+   override init() {
+        super.init()
+    
+        prepareWork()
+    
+    }
+    
+    @objc public func prepareWork() {
+        setUpBoundingBoxes()
+        setUpCoreImage()
+//        setUpVision() ///这里不使用vision库预测
+//        setUpCamera() ///每次新调用videoPreviewLayer：方法再调用
+    }
+    
+    // MARK: - Initialization
+    func setUpBoundingBoxes() {
+        for _ in 0..<YOLO.maxBoundingBoxes {
+            boundingBoxes.append(BoundingBox())
+        }
+        
+        // Make colors for the bounding boxes. There is one color for each class,
+        // 80 classes in total.
+        for _ in 0..<2 {
+            let color = UIColor.green
+            colors.append(color)
+        }
+//        for r: CGFloat in [0.2, 0.4, 0.6, 0.8, 1.0] {
+//            for g: CGFloat in [0.3, 0.7, 0.6, 0.8] {
+//                for b: CGFloat in [0.4, 0.8, 0.6, 1.0] {
+//                    let color = UIColor(red: r, green: g, blue: b, alpha: 1)
+//                    colors.append(color)
+//                }
+//            }
+//        }
+    }
+    
+    func setUpCoreImage() {
+        let status = CVPixelBufferCreate(nil, YOLO.inputWidth, YOLO.inputHeight,
+                                         kCVPixelFormatType_32BGRA, nil,
+                                         &resizedPixelBuffer)
+        if status != kCVReturnSuccess {
+            print("Error: could not create resized pixel buffer", status)
+        }
+    }
+    
+    func setUpVision() {
+        let is410model = UserDefaults.standard.bool(forKey: "kPDYOLOModel416Type")
+        
+        if is410model == true {
+            let model = yolo?.yoloModel as! Yolov3_tiny_v7
+            guard let visionModel = try? VNCoreMLModel(for: model.model) else {
+                print("Error: could not create Vision model")
+                return
+            }
+            request = VNCoreMLRequest(model: visionModel, completionHandler: visionRequestDidComplete)
+            
+        }else{
+            let model = yolo?.yoloModel as! yolov3_tiny_v7_320
+            guard let visionModel = try? VNCoreMLModel(for: model.model) else {
+                print("Error: could not create Vision model")
+                return
+            }
+            request = VNCoreMLRequest(model: visionModel, completionHandler: visionRequestDidComplete)
+        }
+        
+        // NOTE: If you choose another crop/scale option, then you must also
+        // change how the BoundingBox objects get scaled when they are drawn.
+        // Currently they assume the full input image is used.
+        request.imageCropAndScaleOption = .scaleFill
+    }
+    
+    func setUpCamera() {
+        // Add the bounding box layers to the UI, on top of the video preview.
+        for box in self.boundingBoxes {
+            box.addToLayer(videoPreviewLayer)
+        }
+    }
+    func visionRequestDidComplete(request: VNRequest, error: Error?) {
+        if let observations = request.results as? [VNCoreMLFeatureValueObservation],
+            let features = observations.first?.featureValue.multiArrayValue {
+            
+            let boundingBoxes = yolo?.computeBoundingBoxes(features: [features, features, features])
+            isBusying -= 1
+            //            showOnMainThread(boundingBoxes!)
+        }else{
+            isBusying -= 1
+        }
+    }
+    func measureFPS() -> Double {
+        // Measure how many frames were actually delivered per second.
+        framesDone += 1
+        let frameCapturingElapsed = CACurrentMediaTime() - frameCapturingStartTime
+        let currentFPSDelivered = Double(framesDone) / frameCapturingElapsed
+        if frameCapturingElapsed > 1 {
+            framesDone = 0
+            frameCapturingStartTime = CACurrentMediaTime()
+        }
+        
+        return currentFPSDelivered
+    }
+    // MARK: - Doing inference
+    
+    func predict(pixelBuffer: CVPixelBuffer) {
+        // Resize the input with Core Image to 416x416.
+//        let startElapsed = CACurrentMediaTime()
+        guard let resizedPixelBuffer = resizedPixelBuffer else { return }
+        let ciImage = CIImage(cvPixelBuffer: pixelBuffer)
+        let sx = CGFloat(YOLO.inputWidth) / CGFloat(CVPixelBufferGetWidth(pixelBuffer))
+        let sy = CGFloat(YOLO.inputHeight) / CGFloat(CVPixelBufferGetHeight(pixelBuffer))
+        let scaleTransform = CGAffineTransform(scaleX: sx, y: sy)
+        let scaledImage = ciImage.transformed(by: scaleTransform)
+        ciContext.render(scaledImage, to: resizedPixelBuffer)
+        
+        // This is an alternative way to resize the image (using vImage):
+        //if let resizedPixelBuffer = resizePixelBuffer(pixelBuffer,
+        //                                              width: YOLO.inputWidth,
+        //                                              height: YOLO.inputHeight)
+        
+        // Resize the input to 416x416 and give it to our model.
+        guard yolo != nil else {
+            stopPredict()
+            return
+        }
+        if let boundingBoxes = try? yolo?.predict(image: resizedPixelBuffer) {
+            
+//            let endElapsed = CACurrentMediaTime()
+//            let elapsed = endElapsed - startElapsed
+//            print("********************预测时间\(elapsed)")
+            showOnMainThread2(boundingBoxes!, pixel: pixelBuffer)
+            isBusying -= 1
+        }else{
+            isBusying -= 1
+        }
+    }
+    
+    func showOnMainThread(_ boundingBoxes: [YOLO.Prediction],pixel:CVPixelBuffer) {
+        DispatchQueue.main.async {
+            self.show(predictions: boundingBoxes,pixel:pixel)
+        }
+    }
+    func showOnMainThread2(_ boundingBoxes: [YOLO.Prediction],pixel:CVPixelBuffer) {
+
+            self.showBoxs(predictions: boundingBoxes, pixel: pixel)
+
+    }
+    
+    func showBoxs(predictions : [YOLO.Prediction],pixel:CVPixelBuffer) {
+        
+        if predictions.count <= 0 {
+            DispatchQueue.main.async{
+                self.boundingBoxes.forEach { (box) in
+                    box.hide()
+                }
+                if self.delegate != nil{
+                    self.delegate?.predictCells!(cells: [ZXPredictionModel]())
+                }
+            }
+        }else{
+            var cells = [ZXPredictionModel]()
+            
+            let width = videoPreviewLayer.bounds.width
+            let height = videoPreviewLayer.bounds.height//width * 4 / 3
+            let scaleX = width / CGFloat(YOLO.inputWidth)
+            let scaleY = height / CGFloat(YOLO.inputHeight)
+            
+            for i in 0..<predictions.count {
+                let prediction = predictions[i]
+                var prerect = prediction.rect
+                prerect.origin.x *= scaleX
+                prerect.origin.y *= scaleY
+                prerect.size.width *= scaleX
+                prerect.size.height *= scaleY
+//                 print("*******rect=\(prerect)")
+                
+                let label = String(format: "%@", labels[prediction.classIndex])
+                let model = ZXPredictionModel()
+                model.rect = prerect
+                model.typeString = label
+                model.score = prediction.score
+                cells.append(model);
+            }
+            
+            let ciImg = CIImage(cvPixelBuffer: pixel)
+            let sx = width / CGFloat(CVPixelBufferGetWidth(pixel))
+            let sy = height / CGFloat(CVPixelBufferGetHeight(pixel))
+            let scaleTransform = CGAffineTransform(scaleX: sx, y: sy)
+            let scaledImage = ciImg.transformed(by: scaleTransform)
+            let cgImage = ciCon.createCGImage(scaledImage, from: scaledImage.extent)
+            
+            let boxs = PDDetectTargetObjective.detectTarget(with: UIImage.init(cgImage: cgImage!), withBoxs: cells)
+            
+            for i in 0..<self.boundingBoxes.count {
+                if i < boxs.count {
+                    let model = boxs[i]
+                    let rect = model.rect
+                    DispatchQueue.main.async {
+                        self.boundingBoxes[i].show(frame: model.rect, label: model.typeString, color: self.colors[0])
+                    }
+                    
+                    if (i < 4){
+                        var w:CGFloat = max(rect.size.width, rect.size.height);
+                        if w >= width || w < 70.0
+                        {
+                            w = 70.0
+                        }
+                        var x:CGFloat = rect.midX - w/2.0;
+                        var y:CGFloat = rect.midY - w/2.0;
+                        if x < 0.0 {
+                            x = 0.0
+                        }
+                        if x >= (width - w)
+                        {
+                            x = width - w - 2.0
+                        }
+                        
+                        if y < 0 {
+                            y = 0
+                        }
+                        if y >= (height - w)
+                        {
+                            y = height - w - 2.0;
+                        }
+                        
+                        let rect2 = CGRect.init(x: x, y: y, width: w, height: w);
+                        if videoPreviewLayer.bounds.contains(rect2) == true{
+                            let cgimg = cgImage!.cropping(to:rect2)
+                            let img =  UIImage.init(cgImage: cgimg!)
+                            model.image = img;
+                        }else{
+                            //                        print("*******rect2=\(rect2) model.rect=\(model.rect)")
+                            let cgimg = cgImage!.cropping(to:CGRect.init(x: 0.0, y: 0.0, width: 70.0, height: 70.0))
+                            let img =  UIImage.init(cgImage: cgimg!)
+                            model.image = img;
+                        }
+                    }
+                    
+                    
+                }else{
+                    DispatchQueue.main.async {
+                      self.boundingBoxes[i].hide()
+                    }
+                }
+            }
+            DispatchQueue.main.async {
+                if self.delegate != nil{
+                    self.delegate?.predictCells!(cells: boxs)
+                }
+            }
+        }
+        if predictStatus == false{
+            stopPredict()
+        }
+    }
+    
+    func show(predictions: [YOLO.Prediction],pixel:CVPixelBuffer) {
+        print("********正在预测*******\(predictions.count)cells")
+        if !(ZXObjectDetection.testDebug) {
+            if predictions.count <= 0 {
+                self.boundingBoxes.forEach { (box) in
+                    box.hide()
+                }
+            }else{
+                let width = videoPreviewLayer.bounds.width
+                let height = videoPreviewLayer.bounds.height//width * 4 / 3
+                let scaleX = width / CGFloat(YOLO.inputWidth)
+                let scaleY = height / CGFloat(YOLO.inputHeight)
+                
+                var cells = [ZXPredictionModel]()
+                let ciImg = CIImage(cvPixelBuffer: pixel)
+                let sx = width / CGFloat(CVPixelBufferGetWidth(pixel))
+                let sy = height / CGFloat(CVPixelBufferGetHeight(pixel))
+                let scaleTransform = CGAffineTransform(scaleX: sx, y: sy)
+                let scaledImage = ciImg.transformed(by: scaleTransform)
+                let cgImage = ciCon.createCGImage(scaledImage, from: scaledImage.extent)
+                
+                for i in 0..<boundingBoxes.count {
+                    if i < predictions.count {
+                        let prediction = predictions[i]
+                        
+                        var rect = prediction.rect
+                        rect.origin.x *= scaleX
+                        rect.origin.y *= scaleY
+                        // rect.origin.y += top
+                        rect.size.width *= scaleX
+                        rect.size.height *= scaleY
+                        
+                        // Show the bounding box.
+                        let label = String(format: "%@", labels[prediction.classIndex])
+                        let color = colors[prediction.classIndex]
+                        self.boundingBoxes[i].show(frame: rect, label: label, color: color)
+                        
+                        
+                        let model = ZXPredictionModel()
+                        model.rect = rect
+                        model.typeString = label
+                        model.score = prediction.score
+                        var w:CGFloat = max(rect.size.width, rect.size.height);
+                        w = w < 70.0 ? 70.0 : w
+                        let x = rect.midX - w/2.0;
+                        let y = rect.midY - w/2.0;
+                        let rect2 = CGRect.init(x: x, y: y, width: w, height: w);
+                        let cgimg = cgImage!.cropping(to:rect2)
+                        let img =  UIImage.init(cgImage: cgimg!)
+                        model.image = img;
+                        cells.append(model)
+                        
+                    } else {
+                        boundingBoxes[i].hide()
+                    }
+                }
+                if delegate != nil{
+                    self.delegate?.predictCells!(cells: cells)
+                }
+            }
+        }else{
+            if boundingBoxes.count > predictions.count
+            {
+                let removeCount = boundingBoxes.count - predictions.count;
+                if boundingBoxes.count > 10 && removeCount > 0 {
+                    for _ in 0..<removeCount {
+                        if boundingBoxes.count <= 10{
+                            break
+                        }
+                        boundingBoxes.last?.shapeLayer.removeFromSuperlayer()
+                        boundingBoxes.removeLast()
+                    }
+                }
+            }
+            var boundingBoxIterator = boundingBoxes.makeIterator()
+            boundingBoxIterator.next()?.hide()
+            
+            let width = videoPreviewLayer.bounds.width
+            let height = videoPreviewLayer.bounds.height//width * 4 / 3
+            let scaleX = width / CGFloat(YOLO.inputWidth)
+            let scaleY = height / CGFloat(YOLO.inputHeight)
+            
+            var cells = [ZXPredictionModel]()
+            
+            let ciImg = CIImage(cvPixelBuffer: pixel)
+            let sx = width / CGFloat(CVPixelBufferGetWidth(pixel))
+            let sy = height / CGFloat(CVPixelBufferGetHeight(pixel))
+            let scaleTransform = CGAffineTransform(scaleX: sx, y: sy)
+            let scaledImage = ciImg.transformed(by: scaleTransform)
+            let cgImage = ciCon.createCGImage(scaledImage, from: scaledImage.extent)
+                        
+            for i in 0..<predictions.count {
+                if i >= boundingBoxes.count{
+                    let box = BoundingBox()
+                    box .addToLayer(videoPreviewLayer)
+                    boundingBoxes.append(box)
+                }
+                
+                let prediction = predictions[i]
+                
+                var rect = prediction.rect
+                rect.origin.x *= scaleX
+                rect.origin.y *= scaleY
+                rect.size.width *= scaleX
+                rect.size.height *= scaleY
+                let label = String(format: "%@", labels[prediction.classIndex])
+                let color = colors[prediction.classIndex]
+                boundingBoxes[i].show(frame: rect, label: label, color: color)
+                
+                if i < 10{
+                    let model = ZXPredictionModel()
+                    model.rect = rect
+                    model.typeString = label
+                    model.score = prediction.score
+                    var w:CGFloat = max(rect.size.width, rect.size.height);
+                    w = w < 70.0 ? 70.0 : w
+                    let x = rect.midX - w/2.0;
+                    let y = rect.midY - w/2.0;
+                    let rect2 = CGRect.init(x: x, y: y, width: w, height: w);
+                    let cgimg = cgImage!.cropping(to:rect2)
+                    let img =  UIImage.init(cgImage: cgimg!)
+                    model.image = img;
+                    cells.append(model)
+                }
+                
+            }
+            let hidecount =  boundingBoxes.count - predictions.count
+            if hidecount > 0 {
+                for i in 0..<hidecount{
+                    boundingBoxes[i + predictions.count].hide()
+                }
+            }
+            
+            if delegate != nil{
+                self.delegate?.predictCells!(cells: cells)
+            }
+            
+        }
+        
+        if predictStatus == false{
+            stopPredict()
+        }
+    }
+    
+    @objc public func enqueueVideoDecodedData(pixelBuffer: CVPixelBuffer?) {
+        if predictStatus == false{return}
+        if isBusying >= 2 { isBusying = 2; return}
+        
+        isBusying += 1
+        
+        if let pixelBuffer = pixelBuffer {
+            DispatchQueue.global().async {
+                self.predict(pixelBuffer: pixelBuffer)
+            }
+        }else{
+            isBusying -= 1
+        }
+    }
+}
+import Foundation
+import Accelerate
+
+func resizePixelBuffer(_ srcPixelBuffer: CVPixelBuffer,
+                       cropX: Int,
+                       cropY: Int,
+                       cropWidth: Int,
+                       cropHeight: Int,
+                       scaleWidth: Int,
+                       scaleHeight: Int) -> CVPixelBuffer? {
+
+  CVPixelBufferLockBaseAddress(srcPixelBuffer, CVPixelBufferLockFlags(rawValue: 0))
+  guard let srcData = CVPixelBufferGetBaseAddress(srcPixelBuffer) else {
+    print("Error: could not get pixel buffer base address")
+    return nil
+  }
+  let srcBytesPerRow = CVPixelBufferGetBytesPerRow(srcPixelBuffer)
+  let offset = cropY*srcBytesPerRow + cropX*4
+  var srcBuffer = vImage_Buffer(data: srcData.advanced(by: offset),
+                                height: vImagePixelCount(cropHeight),
+                                width: vImagePixelCount(cropWidth),
+                                rowBytes: srcBytesPerRow)
+
+  let destBytesPerRow = scaleWidth*4
+  guard let destData = malloc(scaleHeight*destBytesPerRow) else {
+    print("Error: out of memory")
+    return nil
+  }
+  var destBuffer = vImage_Buffer(data: destData,
+                                 height: vImagePixelCount(scaleHeight),
+                                 width: vImagePixelCount(scaleWidth),
+                                 rowBytes: destBytesPerRow)
+
+  let error = vImageScale_ARGB8888(&srcBuffer, &destBuffer, nil, vImage_Flags(0))
+  CVPixelBufferUnlockBaseAddress(srcPixelBuffer, CVPixelBufferLockFlags(rawValue: 0))
+  if error != kvImageNoError {
+    print("Error:", error)
+    free(destData)
+    return nil
+  }
+
+  let releaseCallback: CVPixelBufferReleaseBytesCallback = { _, ptr in
+    if let ptr = ptr {
+      free(UnsafeMutableRawPointer(mutating: ptr))
+    }
+  }
+
+  let pixelFormat = CVPixelBufferGetPixelFormatType(srcPixelBuffer)
+  var dstPixelBuffer: CVPixelBuffer?
+  let status = CVPixelBufferCreateWithBytes(nil, scaleWidth, scaleHeight,
+                                            pixelFormat, destData,
+                                            destBytesPerRow, releaseCallback,
+                                            nil, nil, &dstPixelBuffer)
+  if status != kCVReturnSuccess {
+    print("Error: could not create new pixel buffer")
+    free(destData)
+    return nil
+  }
+  return dstPixelBuffer
+}
+
+func resizePixelBuffer(_ pixelBuffer: CVPixelBuffer,
+                       width: Int, height: Int) -> CVPixelBuffer? {
+  return resizePixelBuffer(pixelBuffer, cropX: 0, cropY: 0,
+                           cropWidth: CVPixelBufferGetWidth(pixelBuffer),
+                           cropHeight: CVPixelBufferGetHeight(pixelBuffer),
+                           scaleWidth: width, scaleHeight: height)
+}
+import Foundation
+import UIKit
+import CoreML
+import Accelerate
+
+// The labels for the 80 classes.
+
+
+let labels = ["car","person"]
+let anchors: [[Float]] = [ [171,259,  192,114,  360,232], [64,35,  102,166,  112,63],[19,24,  34,58,  58,91]]
+
+//let labels = [
+//    "person", "bicycle", "car", "motorbike", "aeroplane", "bus", "train", "truck", "boat", "traffic light",
+//    "fire hydrant", "stop sign", "parking meter", "bench", "bird", "cat", "dog", "horse", "sheep", "cow",
+//    "elephant", "bear", "zebra", "giraffe", "backpack", "umbrella", "handbag", "tie", "suitcase", "frisbee",
+//    "skis", "snowboard", "sports ball", "kite", "baseball bat", "baseball glove", "skateboard", "surfboard", "tennis racket", "bottle",
+//    "wine glass", "cup", "fork", "knife", "spoon", "bowl", "banana", "apple", "sandwich", "orange",
+//    "broccoli", "carrot", "hot dog", "pizza", "donut", "cake", "chair", "sofa", "pottedplant", "bed",
+//    "diningtable", "toilet", "tvmonitor", "laptop", "mouse", "remote", "keyboard", "cell phone", "microwave", "oven",
+//    "toaster", "sink", "refrigerator", "book", "clock", "vase", "scissors", "teddy bear", "hair drier", "toothbrush"
+//]
+//
+//let anchors: [[Float]] = [[116,90,  156,198,  373,326], [30,61,  62,45,  59,119], [10,13,  16,30,  33,23]]
+
+/**
+  Removes bounding boxes that overlap too much with other boxes that have
+  a higher score.
+
+  Based on code from https://github.com/tensorflow/tensorflow/blob/master/tensorflow/core/kernels/non_max_suppression_op.cc
+
+  - Parameters:
+    - boxes: an array of bounding boxes and their scores
+    - limit: the maximum number of boxes that will be selected
+    - threshold: used to decide whether boxes overlap too much
+*/
+func nonMaxSuppression(boxes: [YOLO.Prediction], limit: Int, threshold: Float) -> [YOLO.Prediction] {
+
+  // Do an argsort on the confidence scores, from high to low.
+  let sortedIndices = boxes.indices.sorted { boxes[$0].score > boxes[$1].score }
+
+  var selected: [YOLO.Prediction] = []
+  var active = [Bool](repeating: true, count: boxes.count)
+  var numActive = active.count
+
+  // The algorithm is simple: Start with the box that has the highest score.
+  // Remove any remaining boxes that overlap it more than the given threshold
+  // amount. If there are any boxes left (i.e. these did not overlap with any
+  // previous boxes), then repeat this procedure, until no more boxes remain
+  // or the limit has been reached.
+  outer: for i in 0..<boxes.count {
+    if active[i] {
+      let boxA = boxes[sortedIndices[i]]
+      selected.append(boxA)
+      if selected.count >= limit { break }
+
+      for j in i+1..<boxes.count {
+        if active[j] {
+          let boxB = boxes[sortedIndices[j]]
+          if IOU(a: boxA.rect, b: boxB.rect) > threshold {
+            active[j] = false
+            numActive -= 1
+            if numActive <= 0 { break outer }
+          }
+        }
+      }
+    }
+  }
+  return selected
+}
+
+/**
+  Computes intersection-over-union overlap between two bounding boxes.
+*/
+public func IOU(a: CGRect, b: CGRect) -> Float {
+  let areaA = a.width * a.height
+  if areaA <= 0 { return 0 }
+
+  let areaB = b.width * b.height
+  if areaB <= 0 { return 0 }
+
+  let intersectionMinX = max(a.minX, b.minX)
+  let intersectionMinY = max(a.minY, b.minY)
+  let intersectionMaxX = min(a.maxX, b.maxX)
+  let intersectionMaxY = min(a.maxY, b.maxY)
+  let intersectionArea = max(intersectionMaxY - intersectionMinY, 0) *
+                         max(intersectionMaxX - intersectionMinX, 0)
+  return Float(intersectionArea / (areaA + areaB - intersectionArea))
+}
+
+extension Array where Element: Comparable {
+  /**
+    Returns the index and value of the largest element in the array.
+  */
+  public func argmax() -> (Int, Element) {
+    precondition(self.count > 0)
+    var maxIndex = 0
+    var maxValue = self[0]
+    for i in 1..<self.count {
+      if self[i] > maxValue {
+        maxValue = self[i]
+        maxIndex = i
+      }
+    }
+    return (maxIndex, maxValue)
+  }
+}
+
+/**
+  Logistic sigmoid.
+*/
+public func sigmoid(_ x: Float) -> Float {
+  return 1 / (1 + exp(-x))
+}
+
+/**
+  Computes the "softmax" function over an array.
+
+  Based on code from https://github.com/nikolaypavlov/MLPNeuralNet/
+
+  This is what softmax looks like in "pseudocode" (actually using Python
+  and numpy):
+
+      x -= np.max(x)
+      exp_scores = np.exp(x)
+      softmax = exp_scores / np.sum(exp_scores)
+
+  First we shift the values of x so that the highest value in the array is 0.
+  This ensures numerical stability with the exponents, so they don't blow up.
+*/
+public func softmax(_ x: [Float]) -> [Float] {
+  var x = x
+  let len = vDSP_Length(x.count)
+
+  // Find the maximum value in the input array.
+  var max: Float = 0
+  vDSP_maxv(x, 1, &max, len)
+
+  // Subtract the maximum from all the elements in the array.
+  // Now the highest value in the array is 0.
+  max = -max
+  vDSP_vsadd(x, 1, &max, &x, 1, len)
+
+  // Exponentiate all the elements in the array.
+  var count = Int32(x.count)
+  vvexpf(&x, x, &count)
+
+  // Compute the sum of all exponentiated values.
+  var sum: Float = 0
+  vDSP_sve(x, 1, &sum, len)
+
+  // Divide each element by the sum. This normalizes the array contents
+  // so that they all add up to 1.
+  vDSP_vsdiv(x, 1, &sum, &x, 1, len)
+
+  return x
+}
+import UIKit
+import AVFoundation
+import CoreVideo
+
+public protocol VideoCaptureDelegate: class {
+  func videoCapture(_ capture: VideoCapture, didCaptureVideoFrame: CVPixelBuffer?, timestamp: CMTime)
+}
+
+public class VideoCapture: NSObject {
+  public var previewLayer: AVCaptureVideoPreviewLayer?
+  public weak var delegate: VideoCaptureDelegate?
+  public var fps = 15
+
+  let captureSession = AVCaptureSession()
+  let videoOutput = AVCaptureVideoDataOutput()
+  let queue = DispatchQueue(label: "net.machinethink.camera-queue")
+
+  var lastTimestamp = CMTime()
+
+  public func setUp(sessionPreset: AVCaptureSession.Preset = .medium,
+                    completion: @escaping (Bool) -> Void) {
+    queue.async {
+      let success = self.setUpCamera(sessionPreset: sessionPreset)
+      DispatchQueue.main.async {
+        completion(success)
+      }
+    }
+  }
+
+  func setUpCamera(sessionPreset: AVCaptureSession.Preset) -> Bool {
+    captureSession.beginConfiguration()
+    captureSession.sessionPreset = sessionPreset
+
+    guard let captureDevice = AVCaptureDevice.default(for: AVMediaType.video) else {
+      print("Error: no video devices available")
+      return false
+    }
+
+    guard let videoInput = try? AVCaptureDeviceInput(device: captureDevice) else {
+      print("Error: could not create AVCaptureDeviceInput")
+      return false
+    }
+
+    if captureSession.canAddInput(videoInput) {
+      captureSession.addInput(videoInput)
+    }
+
+    let previewLayer = AVCaptureVideoPreviewLayer(session: captureSession)
+    previewLayer.videoGravity = AVLayerVideoGravity.resizeAspect
+    previewLayer.connection?.videoOrientation = .portrait
+    self.previewLayer = previewLayer
+
+    let settings: [String : Any] = [
+      kCVPixelBufferPixelFormatTypeKey as String: NSNumber(value: kCVPixelFormatType_32BGRA),
+    ]
+
+    videoOutput.videoSettings = settings
+    videoOutput.alwaysDiscardsLateVideoFrames = true
+    videoOutput.setSampleBufferDelegate(self, queue: queue)
+    if captureSession.canAddOutput(videoOutput) {
+      captureSession.addOutput(videoOutput)
+    }
+
+    // We want the buffers to be in portrait orientation otherwise they are
+    // rotated by 90 degrees. Need to set this _after_ addOutput()!
+    videoOutput.connection(with: AVMediaType.video)?.videoOrientation = .portrait
+
+    captureSession.commitConfiguration()
+    return true
+  }
+
+  public func start() {
+    if !captureSession.isRunning {
+      captureSession.startRunning()
+    }
+  }
+
+  public func stop() {
+    if captureSession.isRunning {
+      captureSession.stopRunning()
+    }
+  }
+}
+
+extension VideoCapture: AVCaptureVideoDataOutputSampleBufferDelegate {
+  public func captureOutput(_ output: AVCaptureOutput, didOutput sampleBuffer: CMSampleBuffer, from connection: AVCaptureConnection) {
+    // Because lowering the capture device's FPS looks ugly in the preview,
+    // we capture at full speed but only call the delegate at its desired
+    // framerate.
+    let timestamp = CMSampleBufferGetPresentationTimeStamp(sampleBuffer)
+    let deltaTime = timestamp - lastTimestamp
+    if deltaTime >= CMTimeMake(1, Int32(fps)) {
+      lastTimestamp = timestamp
+      let imageBuffer = CMSampleBufferGetImageBuffer(sampleBuffer)
+      delegate?.videoCapture(self, didCaptureVideoFrame: imageBuffer, timestamp: timestamp)
+    }
+  }
+
+  public func captureOutput(_ output: AVCaptureOutput, didDrop sampleBuffer: CMSampleBuffer, from connection: AVCaptureConnection) {
+    //print("dropped frame")
+  }
+}
+import Foundation
+import UIKit
+
+class BoundingBox {
+  let shapeLayer: CAShapeLayer
+
+  init() {
+    shapeLayer = CAShapeLayer()
+    shapeLayer.fillColor = UIColor.clear.cgColor
+    shapeLayer.lineWidth = 2
+    shapeLayer.isHidden = true
+  }
+
+  func addToLayer(_ parent: CALayer) {
+    parent.addSublayer(shapeLayer)
+  }
+
+  func show(frame: CGRect, label: String, color: UIColor) {
+    CATransaction.setDisableActions(true)
+
+    let point = frame.origin
+    let size  = frame.size
+    let x = point.x
+    let y = point.y
+    let w = size.width
+    let h = size.height
+    
+    let path = UIBezierPath()
+    //左上角
+    let y1 = h/3.0 + y
+    path.move(to: CGPoint(x: x, y: y1))
+    path.addLine(to: CGPoint(x: x, y: y))
+    let x1 = w/3.0 + x
+    path.addLine(to: CGPoint(x: x1, y: y))
+    
+    //右上角
+    path.move(to: CGPoint(x: frame.maxX - w/3.0, y: y))
+    path.addLine(to: CGPoint(x: frame.maxX, y: y))
+    path.addLine(to: CGPoint(x: frame.maxX, y: y1))
+    
+    //右下角
+    path.move(to: CGPoint(x: frame.maxX, y: frame.maxY - h/3.0))
+    path.addLine(to: CGPoint(x: frame.maxX, y: frame.maxY))
+    path.addLine(to: CGPoint(x: frame.maxX - w/3.0, y: frame.maxY))
+    
+    //左下角
+    path.move(to: CGPoint(x: x1, y: frame.maxY))
+    path.addLine(to: CGPoint(x: x, y: frame.maxY))
+    path.addLine(to: CGPoint(x: x, y: frame.maxY - h/3.0))
+    
+    let path0 = UIBezierPath.init(arcCenter: CGPoint(x: frame.midX, y: frame.midY), radius: 1.0, startAngle: 0, endAngle: CGFloat(.pi * 2.0), clockwise: true)
+    path.append(path0)
+    
+    //圆弧
+    let r = w < h ? w : h
+    let c = CGPoint(x: frame.midX, y: frame.midY)
+    
+    let path1 = UIBezierPath()
+    path1.addArc(withCenter: c, radius: r/3.0, startAngle: CGFloat(.pi/10.0), endAngle: CGFloat(.pi * 4.0/10.0), clockwise: true)
+    
+    let path2 = UIBezierPath()
+    path2.addArc(withCenter: c, radius: r/3.0, startAngle: CGFloat(.pi * 6.0 / 10.0), endAngle: CGFloat(.pi * 9.0 / 10.0), clockwise: true)
+    
+    let path3 = UIBezierPath()
+    path3.addArc(withCenter: c, radius: r/3.0, startAngle: CGFloat(.pi * 11.0 / 10.0), endAngle: CGFloat(.pi * 14.0 / 10.0), clockwise: true)
+    
+    let path4 = UIBezierPath()
+    path4.addArc(withCenter: c, radius: r/3.0, startAngle: CGFloat(.pi * 16.0 / 10.0), endAngle: CGFloat(.pi * 19.0 / 10.0), clockwise: true)
+    
+    path.append(path1)
+    path.append(path2)
+    path.append(path3)
+    path.append(path4)
+    
+    
+    shapeLayer.path = path.cgPath
+    shapeLayer.strokeColor = color.cgColor
+    shapeLayer.isHidden = false
+
+  }
+
+  func hide() {
+    shapeLayer.isHidden = true
+  }
+}
+import UIKit
+
+extension UIImage {
+  public func pixelBuffer(width: Int, height: Int) -> CVPixelBuffer? {
+    var maybePixelBuffer: CVPixelBuffer?
+    let attrs = [kCVPixelBufferCGImageCompatibilityKey: kCFBooleanTrue,
+                 kCVPixelBufferCGBitmapContextCompatibilityKey: kCFBooleanTrue]
+    let status = CVPixelBufferCreate(kCFAllocatorDefault,
+                                     Int(width),
+                                     Int(height),
+                                     kCVPixelFormatType_32ARGB,
+                                     attrs as CFDictionary,
+                                     &maybePixelBuffer)
+
+    guard status == kCVReturnSuccess, let pixelBuffer = maybePixelBuffer else {
+      return nil
+    }
+
+    CVPixelBufferLockBaseAddress(pixelBuffer, CVPixelBufferLockFlags(rawValue: 0))
+    let pixelData = CVPixelBufferGetBaseAddress(pixelBuffer)
+
+    guard let context = CGContext(data: pixelData,
+                                  width: Int(width),
+                                  height: Int(height),
+                                  bitsPerComponent: 8,
+                                  bytesPerRow: CVPixelBufferGetBytesPerRow(pixelBuffer),
+                                  space: CGColorSpaceCreateDeviceRGB(),
+                                  bitmapInfo: CGImageAlphaInfo.noneSkipFirst.rawValue)
+    else {
+      return nil
+    }
+
+    context.translateBy(x: 0, y: CGFloat(height))
+    context.scaleBy(x: 1, y: -1)
+
+    UIGraphicsPushContext(context)
+    self.draw(in: CGRect(x: 0, y: 0, width: width, height: height))
+    UIGraphicsPopContext()
+    CVPixelBufferUnlockBaseAddress(pixelBuffer, CVPixelBufferLockFlags(rawValue: 0))
+
+    return pixelBuffer
+  }
+}
